@@ -1,0 +1,1131 @@
+---
+title: " ST3189 Machine Learning Coursework"
+format: html
+editor: visual
+---
+
+Project Title \# Detecting Illicit Cryptocurrency Transactions Using Machine Learning: An Analytical Study Using the Elliptic Bitcoin Dataset
+
+# 1. Introduction This coursework examines how machine learning methods can support the detection and prioritisation of potentially illicit cryptocurrency transactions using the Elliptic Bitcoin Dataset.
+
+# 2. Setup
+
+```{r}
+    library(tidyverse)
+    library(readr)
+    library(dplyr)
+    library(ggplot2)
+    library(caret)
+    library(cluster)
+    library(factoextra)
+    library(randomForest)
+    library(e1071)
+    library(glmnet)
+    library(pROC)
+    library(writexl)
+```
+
+# 3. Data Import
+
+```{r}
+features <- read_csv("data/elliptic_txs_features.csv", col_names = FALSE, show_col_types = FALSE)
+classes  <- read_csv("data/elliptic_txs_classes.csv", show_col_types = FALSE)
+edgelist <- read_csv("data/elliptic_txs_edgelist.csv", show_col_types = FALSE)
+```
+
+# 4. Data Inspection
+
+```{r}
+dim(features)
+dim(classes)
+dim(edgelist)
+
+colnames(classes)
+colnames(edgelist)
+
+head(features, 3)
+head(classes, 3)
+head(edgelist, 3)
+
+table(classes$class, useNA = "ifany")
+```
+
+# 5. Data Preparation
+
+```{r}
+colnames(features)[1:2] <- c("txId", "time_step")
+
+if (ncol(features) > 2) {
+  colnames(features)[3:ncol(features)] <- paste0("feature_", 1:(ncol(features) - 2))
+}
+
+# Merge transaction features with class labels
+df <- features %>%
+  left_join(classes, by = "txId")
+```
+
+# 6. Merge Validation
+
+```{r}
+dim(df)
+head(df, 3)
+table(df$class, useNA = "ifany")
+sum(is.na(df$class))
+```
+
+# 7. Exploratory Data Analysis
+
+## 7.1 Class distribution
+
+```{r}
+# Class distribution
+class_counts <- df %>%
+  count(class) %>%
+  mutate(percentage = 100 * n / sum(n))
+
+class_counts
+```
+
+## 7.2 Visualise class balance
+
+```{r}
+ggplot(df, aes(x = class)) +
+  geom_bar() +
+  labs(
+    title = "Distribution of Transaction Classes",
+    x = "Class",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+## 7.3 Transactions over time
+
+```{r}
+# Number of transactions by time step
+time_counts <- df %>%
+  count(time_step)
+
+head(time_counts)
+```
+
+```{r}
+ggplot(time_counts, aes(x = time_step, y = n)) +
+  geom_line() +
+  labs(
+    title = "Number of Transactions by Time Step",
+    x = "Time Step",
+    y = "Number of Transactions"
+  ) +
+  theme_minimal()
+```
+
+## 7.4 Class distribution over time
+
+```{r}
+class_time_counts <- df %>%
+  count(time_step, class)
+
+head(class_time_counts)
+```
+
+```{r}
+ggplot(class_time_counts, aes(x = time_step, y = n, color = class)) +
+  geom_line() +
+  labs(
+    title = "Transaction Classes Over Time",
+    x = "Time Step",
+    y = "Number of Transactions",
+    color = "Class"
+  ) +
+  theme_minimal()
+```
+
+## 7.5 Create a cleaned dataset for analysis
+
+```{r}
+df_clean <- df %>%
+  filter(!is.na(class))
+
+dim(df_clean)
+table(df_clean$class, useNA = "ifany")
+```
+
+Inspect how the classes are coded on the dataset. Because we already ran table(df\$class, useNA = "ifany"), will be used the exact labels observed there. This will keep all labelled rows and remove only missing labels.
+
+## 7.6 Separate labelled and unknown cases
+
+```{r}
+# Keep only transactions with known class labels for supervised learning
+df_labelled <- df_clean %>%
+  filter(class %in% c("1", "2")) %>%
+  mutate(
+    class_code = class,
+    class_label = case_when(
+      class == "1" ~ "illicit",
+      class == "2" ~ "licit",
+      TRUE ~ class
+    )
+  )
+```
+
+Keep unknown transactions as a separate subset
+
+```{r}
+df_unknown <- df_clean %>%
+  filter(class == "unknown")
+
+dim(df_labelled)
+dim(df_unknown)
+
+table(df_labelled$class_code)
+table(df_labelled$class_label)
+```
+
+Following the dataset documentation, class1 is interpreted as illicit and class2 as licit. Unknown transactions are retained as a separate subset and excluded from supervised classification. This separation is useful because df_labelled will be used for predictive modelling, while df_unknown reflects the realistic uncertainty commonly present in AML data.
+
+## 7.7 Summary statistics for selected features
+
+```{r}
+summary(df_clean[, 1:10])
+```
+
+## 7.8 Missing values in the dataset
+
+```{r}
+total_missing <- sum(is.na(df_clean))
+total_missing
+```
+
+This checks whether missingness is a major issue before modelling.
+
+## 7.9 Variance check for numeric features
+
+```{r}
+numeric_data <- df_clean %>%
+  select(where(is.numeric))
+
+feature_variances <- apply(numeric_data, 2, var, na.rm = TRUE)
+
+summary(feature_variances)
+```
+
+This is useful because some features may be constant or nearly constant.
+
+```{r}
+low_variance_features <- names(feature_variances[feature_variances == 0])
+low_variance_features
+```
+
+This will help later when preparing data for PCA, clustering, and modelling.
+
+```{r}
+colnames(features)[1:5]
+colnames(df)[1:5]
+
+time_counts <- df %>%
+  count(time_step)
+
+head(time_counts)
+```
+
+# 8. Unsupervised Learning
+
+## 8.1 Data preparation for unsupervised learning
+
+```{r}
+# Select numeric variables for unsupervised learning
+unsup_data <- df_clean %>%
+  select(-txId, -class)
+
+# Check dimensions
+dim(unsup_data)
+
+# Confirm all remaining columns are numeric
+sapply(unsup_data, class)[1:10]
+```
+
+For unsupervised learning, the transaction identifier and class label are excluded. The analysis is therefore based only on numeric transaction attributes, which is appropriate because clustering and PCA should not use the supervised target variable.
+
+## 8.2 Scale the features
+
+```{r}
+# Standardise features before PCA and clustering
+unsup_scaled <- scale(unsup_data)
+
+dim(unsup_scaled)
+```
+
+Feature scaling is necessary because variables may be measured on different scales. Without standardisation, variables with larger magnitudes could dominate distance-based methods such as K-means and also distort PCA.
+
+## 8.3 Principal Component Analysis
+
+```{r}
+# Perform PCA
+pca_result <- prcomp(unsup_scaled, center = TRUE, scale. = FALSE)
+
+# Summary of explained variance
+summary(pca_result)
+```
+
+```{r}
+# Proportion of variance explained
+pca_variance <- pca_result$sdev^2
+pca_var_explained <- pca_variance / sum(pca_variance)
+
+head(pca_var_explained, 10)
+```
+
+```{r}
+# Scree plot
+fviz_eig(pca_result, addlabels = TRUE)
+```
+
+PCA is used here as a dimensionality-reduction method to summarise the transaction feature space and identify the main directions of variation. This does not imply that principal components correspond directly to illicit behaviour; rather, they provide a lower-dimensional representation of overall transaction structure.
+
+## 8.4 Visualise the first two principal components
+
+```{r}
+# Create PCA scores dataframe
+pca_scores <- as.data.frame(pca_result$x[, 1:2])
+colnames(pca_scores) <- c("PC1", "PC2")
+
+pca_scores <- pca_scores %>%
+  mutate(class = df_clean$class)
+
+head(pca_scores)
+```
+
+```{r}
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = class)) +
+  geom_point(alpha = 0.5, size = 1) +
+  labs(
+    title = "PCA Projection of Transactions",
+    x = "Principal Component 1",
+    y = "Principal Component 2",
+    color = "Class"
+  ) +
+  theme_minimal()
+```
+
+This plot helps assess whether the feature space shows visible separation between transaction groups. Any apparent separation should be interpreted cautiously, since PCA is unsupervised and only preserves major variance directions.
+
+## 8.5 Candidate numbers of clusters
+
+```{r}
+# Use a reproducible sample for cluster diagnostics
+set.seed(123)
+
+sample_size <- 10000
+sample_index <- sample(nrow(unsup_scaled), sample_size)
+
+unsup_sample <- unsup_scaled[sample_index, ]
+dim(unsup_sample)
+```
+
+```{r}
+# Evaluate within-cluster sum of squares for different k
+#fviz_nbclust(unsup_scaled, kmeans, method = "wss") +
+#  labs(title = "Elbow Method for Choosing Number of Clusters")
+
+# Elbow method on a sample
+fviz_nbclust(unsup_sample, kmeans, method = "wss") +
+  labs(title = "Elbow Method for Choosing Number of Clusters (Sample)")
+```
+
+The elbow plot suggests that the largest reduction in within-cluster variation occurs at low values of k, with the most pronounced decreases observed up to k=2 and k=3. Beyond that point, the curve flattens, indicating diminishing returns from adding further clusters.
+
+```{r}
+# Evaluate average silhouette width for different k
+#fviz_nbclust(unsup_scaled, kmeans, method = "silhouette") +
+#  labs(title = "Silhouette Method for Choosing Number of Clusters")
+
+# Silhouette method on a sample
+fviz_nbclust(unsup_sample, kmeans, method = "silhouette") +
+  labs(title = "Silhouette Method for Choosing Number of Clusters (Sample)")
+```
+
+Silhouette method
+
+The silhouette method provides a clearer indication, reaching its maximum at k=2. This suggests that a two-cluster solution offers the strongest separation in the sampled data. Taken together, the diagnostics support k=2 as the primary clustering specification for the subsequent K-means analysis.
+
+The elbow plot suggests that the largest reduction in within-cluster variation occurs at low values of k, with some evidence of diminishing returns after k=2 or k=3. The silhouette method provides a clearer indication, reaching its maximum at k=2. On this basis, k=2 is selected as the primary clustering solution for the subsequent K-means analysis.
+
+## 8.6 Fit K-means clustering
+
+```{r}
+set.seed(123)
+
+kmeans_result <- kmeans(unsup_sample, centers = 2, nstart = 25)
+
+kmeans_result$size
+length(kmeans_result$cluster)
+```
+
+```{r}
+# Create PCA scores for sampled observations
+pca_scores_sample <- as.data.frame(pca_result$x[sample_index, 1:2])
+colnames(pca_scores_sample) <- c("PC1", "PC2")
+
+pca_scores_sample <- pca_scores_sample %>%
+  mutate(
+    class = df_clean$class[sample_index],
+    cluster = factor(kmeans_result$cluster)
+  )
+
+head(pca_scores_sample)
+```
+
+```{r}
+ggplot(pca_scores_sample, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.5, size = 1) +
+  labs(
+    title = "K-means Clusters in PCA Space (k = 2)",
+    x = "Principal Component 1",
+    y = "Principal Component 2",
+    color = "Cluster"
+  ) +
+  theme_minimal()
+```
+
+K-means is used here as an exploratory clustering method. The resulting clusters represent similarity groupings in the transaction feature space and should not be interpreted as direct categories of criminality.
+
+## 8.7 Compare clusters with observed class labels
+
+```{r}
+cluster_class_table <- table(
+  cluster = pca_scores_sample$cluster,
+  class = pca_scores_sample$class
+)
+
+cluster_class_table
+```
+
+```{r}
+prop.table(cluster_class_table, margin = 1)
+```
+
+Comparing cluster assignments with known class labels helps assess whether unsupervised groupings align in any meaningful way with licit, illicit, or unknown activity. However, clustering is exploratory and should not be interpreted as a classification method.
+
+# 9. Regression
+
+## 9.1 Create a continuous proxy risk score
+
+```{r}
+# Create a proxy risk score for regression analysis
+df_regression <- df_clean %>%
+  mutate(
+    risk_score = case_when(
+      class == "1" ~ 1.0,
+      class == "unknown" ~ 0.5,
+      class == "2" ~ 0.0,
+      TRUE ~ NA_real_
+    )
+  )
+
+table(df_regression$class, useNA = "ifany")
+summary(df_regression$risk_score)
+```
+
+The regression task uses an engineered proxy risk score rather than an observed continuous real-world variable. Transactions labelled as illicit are assigned the highest score, licit transactions the lowest score, and unknown transactions an intermediate value. This score is intended to represent relative review priority and should therefore be interpreted as an analytical construct rather than a ground-truth risk measure.
+
+## 9.2 Prepare regression data
+
+```{r}
+# Exclude identifier and original class label from predictors
+regression_data <- df_regression %>%
+  select(-txId, -class)
+
+dim(regression_data)
+sum(is.na(regression_data))
+```
+
+```{r}
+summary(regression_data$risk_score)
+```
+
+## 9.3 Train-test split
+
+```{r}
+set.seed(123)
+
+train_index <- createDataPartition(regression_data$risk_score, p = 0.8, list = FALSE)
+
+train_reg <- regression_data[train_index, ]
+test_reg  <- regression_data[-train_index, ]
+
+dim(train_reg)
+dim(test_reg)
+```
+
+```{r}
+summary(train_reg$risk_score)
+summary(test_reg$risk_score)
+```
+
+## 9.4 Separate predictors and target
+
+```{r}
+x_train_reg <- train_reg %>%
+  select(-risk_score)
+
+y_train_reg <- train_reg$risk_score
+
+x_test_reg <- test_reg %>%
+  select(-risk_score)
+
+y_test_reg <- test_reg$risk_score
+
+dim(x_train_reg)
+length(y_train_reg)
+dim(x_test_reg)
+length(y_test_reg)
+```
+
+## 9.5 Linear Regression
+
+```{r}
+lm_model <- lm(risk_score ~ ., data = train_reg)
+
+lm_predictions <- predict(lm_model, newdata = test_reg)
+
+head(lm_predictions)
+```
+
+## 9.6 Evaluate Linear Regression
+
+```{r}
+lm_rmse <- RMSE(lm_predictions, y_test_reg)
+lm_mae  <- MAE(lm_predictions, y_test_reg)
+lm_r2   <- R2(lm_predictions, y_test_reg)
+
+lm_results <- tibble(
+  Model = "Linear Regression",
+  RMSE = lm_rmse,
+  MAE = lm_mae,
+  R2 = lm_r2
+)
+
+lm_results
+```
+
+## 9.7 Ridge / Lasso Regression
+
+```{r}
+x_train_matrix <- as.matrix(x_train_reg)
+x_test_matrix  <- as.matrix(x_test_reg)
+y_train_vector <- y_train_reg
+y_test_vector  <- y_test_reg
+```
+
+```{r}
+#Ridge regression
+set.seed(123)
+
+ridge_cv <- cv.glmnet(
+  x_train_matrix,
+  y_train_vector,
+  alpha = 0
+)
+
+ridge_predictions <- predict(ridge_cv, s = "lambda.min", newx = x_test_matrix)
+
+ridge_rmse <- RMSE(as.numeric(ridge_predictions), y_test_vector)
+ridge_mae  <- MAE(as.numeric(ridge_predictions), y_test_vector)
+ridge_r2   <- R2(as.numeric(ridge_predictions), y_test_vector)
+```
+
+```{r}
+# Lasso regression
+set.seed(123)
+
+lasso_cv <- cv.glmnet(
+  x_train_matrix,
+  y_train_vector,
+  alpha = 1
+)
+
+lasso_predictions <- predict(lasso_cv, s = "lambda.min", newx = x_test_matrix)
+
+lasso_rmse <- RMSE(as.numeric(lasso_predictions), y_test_vector)
+lasso_mae  <- MAE(as.numeric(lasso_predictions), y_test_vector)
+lasso_r2   <- R2(as.numeric(lasso_predictions), y_test_vector)
+```
+
+## 9.8 Random Forest Regression
+
+```{r}
+set.seed(123)
+
+rf_reg_model <- randomForest(
+  x = x_train_reg,
+  y = y_train_reg,
+  ntree = 100
+)
+
+rf_reg_predictions <- predict(rf_reg_model, newdata = x_test_reg)
+
+rf_reg_rmse <- RMSE(rf_reg_predictions, y_test_vector)
+rf_reg_mae  <- MAE(rf_reg_predictions, y_test_vector)
+rf_reg_r2   <- R2(rf_reg_predictions, y_test_vector)
+
+saveRDS(
+  list(
+    predictions = rf_reg_predictions,
+    rmse = rf_reg_rmse,
+    mae = rf_reg_mae,
+    r2 = rf_reg_r2
+  ),
+  "rf_reg_results.rds"
+)
+```
+
+## 9.9 Compare regression models
+
+```{r}
+regression_results <- tibble(
+  Model = c("Linear Regression", "Ridge Regression", "Lasso Regression", "Random Forest Regression"),
+  RMSE = c(
+    lm_rmse,
+    ridge_rmse,
+    lasso_rmse,
+    rf_reg_rmse
+  ),
+  MAE = c(
+    lm_mae,
+    ridge_mae,
+    lasso_mae,
+    rf_reg_mae
+  ),
+  R2 = c(
+    lm_r2,
+    ridge_r2,
+    lasso_r2,
+    rf_reg_r2
+  )
+)
+
+regression_results
+```
+
+## 9.10 Interpret regression results
+
+The regression models are used to predict a proxy transaction risk score rather than an observed continuous real-world variable. Their purpose is therefore analytical prioritisation rather than causal explanation. Performance should be interpreted in that context: a better model is one that more accurately reproduces the relative ranking implied by the constructed score.
+
+# 10. Classification
+## 10.1 Prepare classification data
+
+```{r classification_prepare_data}
+
+# Keep only labelled transactions for supervised classification
+classification_data <- df_labelled %>%
+  select(-txId, -class, -class_code) %>%
+  mutate(
+    class_label = factor(class_label, levels = c("illicit", "licit"))
+  )
+
+dim(classification_data)
+table(classification_data$class_label)
+```
+## 10.2 Train-test split
+```{r} 
+set.seed(123)
+
+train_index_class <- createDataPartition(
+  classification_data$class_label,
+  p = 0.8,
+  list = FALSE
+)
+
+train_class <- classification_data[train_index_class, ]
+test_class  <- classification_data[-train_index_class, ]
+
+dim(train_class)
+dim(test_class)
+
+table(train_class$class_label)
+table(test_class$class_label)
+```
+
+```{r}
+x_train_class <- train_class %>%
+  select(-class_label)
+
+y_train_class <- train_class$class_label
+
+x_test_class <- test_class %>%
+  select(-class_label)
+
+y_test_class <- test_class$class_label
+
+dim(x_train_class)
+length(y_train_class)
+dim(x_test_class)
+length(y_test_class)
+```
+## 10.3 Train classification models
+### 10.3.1 Logistic Regression
+```{r}
+logit_model <- glm(
+  class_label ~ .,
+  data = train_class,
+  family = binomial
+)
+
+logit_probabilities <- predict(logit_model, newdata = test_class, type = "response")
+
+logit_predictions <- ifelse(logit_probabilities > 0.5, "licit", "illicit") %>%
+  factor(levels = c("illicit", "licit"))
+
+table(logit_predictions)
+```
+
+### 10.3.2 Support Vector Machine
+```{r}
+set.seed(123)
+
+svm_model <- svm(
+  class_label ~ .,
+  data = train_class,
+  kernel = "radial",
+  probability = FALSE
+)
+
+svm_predictions <- predict(svm_model, newdata = test_class) %>%
+  factor(levels = c("illicit", "licit"))
+
+table(svm_predictions)
+```
+
+### 10.3.3 Random Forest Classification
+```{r}
+set.seed(123)
+
+rf_clf_model <- randomForest(
+  x = x_train_class,
+  y = y_train_class,
+  ntree = 100
+)
+
+rf_clf_predictions <- predict(rf_clf_model, newdata = x_test_class) %>%
+  factor(levels = c("illicit", "licit"))
+
+table(rf_clf_predictions)
+```
+
+## 10.4 Evaluate classification models
+```{r}
+cm_logit <- confusionMatrix(
+  data = logit_predictions,
+  reference = y_test_class,
+  positive = "illicit"
+)
+
+cm_svm <- confusionMatrix(
+  data = svm_predictions,
+  reference = y_test_class,
+  positive = "illicit"
+)
+
+cm_rf <- confusionMatrix(
+  data = rf_clf_predictions,
+  reference = y_test_class,
+  positive = "illicit"
+)
+
+cm_logit
+cm_svm
+cm_rf
+```
+```{r}
+# Logistic Regression metrics
+logit_accuracy  <- as.numeric(cm_logit$overall["Accuracy"])
+logit_precision <- as.numeric(cm_logit$byClass["Pos Pred Value"])
+logit_recall    <- as.numeric(cm_logit$byClass["Sensitivity"])
+logit_f1        <- 2 * (logit_precision * logit_recall) / (logit_precision + logit_recall)
+
+# SVM metrics
+svm_accuracy  <- as.numeric(cm_svm$overall["Accuracy"])
+svm_precision <- as.numeric(cm_svm$byClass["Pos Pred Value"])
+svm_recall    <- as.numeric(cm_svm$byClass["Sensitivity"])
+svm_f1        <- 2 * (svm_precision * svm_recall) / (svm_precision + svm_recall)
+
+# Random Forest metrics
+rf_accuracy  <- as.numeric(cm_rf$overall["Accuracy"])
+rf_precision <- as.numeric(cm_rf$byClass["Pos Pred Value"])
+rf_recall    <- as.numeric(cm_rf$byClass["Sensitivity"])
+rf_f1        <- 2 * (rf_precision * rf_recall) / (rf_precision + rf_recall)
+```
+The classification models are evaluated using accuracy, precision, recall, and F1-score. In an AML context, recall for the illicit class is especially important because missed illicit cases may be more consequential than false alarms.
+
+## 10.5 Classification results table
+```{r}
+classification_results <- tibble(
+  Model = c("Logistic Regression", "Support Vector Machine", "Random Forest"),
+  Accuracy = c(logit_accuracy, svm_accuracy, rf_accuracy),
+  Precision = c(logit_precision, svm_precision, rf_precision),
+  Recall = c(logit_recall, svm_recall, rf_recall),
+  F1 = c(logit_f1, svm_f1, rf_f1)
+)
+
+classification_results_table <- classification_results %>%
+  mutate(
+    Accuracy = round(Accuracy, 4),
+    Precision = round(Precision, 4),
+    Recall = round(Recall, 4),
+    F1 = round(F1, 4)
+  )
+
+classification_results_table
+```
+
+## 10.6 Classification model comparison chart
+```{r}
+classification_long <- classification_results_table %>%
+  pivot_longer(
+    cols = c(Accuracy, Precision, Recall, F1),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+ggplot(classification_long, aes(x = Model, y = Value)) +
+  geom_col() +
+  facet_wrap(~ Metric, scales = "free_y") +
+  coord_flip() +
+  labs(
+    title = "Classification Model Comparison",
+    x = "Model",
+    y = "Metric Value"
+  ) +
+  theme_minimal()
+```
+
+## 10.7 Confusion matrix of the best classifier
+```{r}
+# Random Forest was selected as the best classifier
+
+best_cm <- cm_rf
+
+cm_df <- as.data.frame(best_cm$table)
+colnames(cm_df) <- c("Prediction", "Reference", "Freq")
+
+cm_df$Prediction <- factor(cm_df$Prediction, levels = c("licit", "illicit"))
+cm_df$Reference  <- factor(cm_df$Reference, levels = c("illicit", "licit"))
+
+ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 5) +
+  labs(
+    title = "Confusion Matrix of the Random Forest Classifier",
+    x = "Actual Class",
+    y = "Predicted Class"
+  ) +
+  theme_minimal()
+```
+The confusion matrix shows that the Random Forest classifier performs strongly on both classes. It correctly identifies 791 illicit transactions and 8398 licit transactions, while missing 118 illicit cases and incorrectly flagging only 5 licit cases as illicit. This indicates a strong balance between high illicit detection and a very low false-positive rate, which is particularly valuable in an anti-money-laundering context.
+
+
+## 10.8 Feature importance plot
+```{r}
+importance_df <- as.data.frame(importance(rf_clf_model))
+importance_df$Feature <- rownames(importance_df)
+
+importance_top <- importance_df %>%
+  arrange(desc(MeanDecreaseGini)) %>%
+  slice_head(n = 15)
+
+ggplot(
+  importance_top,
+  aes(x = reorder(Feature, MeanDecreaseGini), y = MeanDecreaseGini)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top Predictive Features from Random Forest",
+    x = "Feature",
+    y = "Mean Decrease in Gini"
+  ) +
+  theme_minimal()
+```
+
+The feature importance analysis indicates that a relatively small subset of transaction attributes contributes most strongly to the Random Forest classifier. In particular, feature_66, feature_60, feature_49, feature_41, and feature_14 show the highest importance values. This suggests that the classification task is driven more by certain transaction characteristics than by all variables equally. However, these importance scores should be interpreted as indicators of predictive contribution rather than causal influence.
+
+### 10.9 Top-features table
+
+```{r}
+top_features_table <- importance_top %>%
+  select(Feature, MeanDecreaseGini) %>%
+  rename(Importance = MeanDecreaseGini) %>%
+  mutate(Importance = round(Importance, 4)) %>%
+  slice_head(n = 10) %>%
+  as_tibble()
+
+top_features_table
+```
+
+# 11. Export final figures and tables
+## 11.1 Create output folders
+
+```{r}
+dir.create("figures", showWarnings = FALSE)
+dir.create("outputs", showWarnings = FALSE)
+```
+
+## 11.2 Export final figures
+### 11.2.1 Class distribution plot
+```{r}
+fig_class_distribution <- ggplot(df, aes(x = class)) +
+  geom_bar() +
+  labs(
+    title = "Distribution of Transaction Classes",
+    x = "Class",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = "figures/01_class_distribution.png",
+  plot = fig_class_distribution,
+  width = 8,
+  height = 5.5,
+  dpi = 300
+)
+```
+
+### 11.2.2 PCA projection plot
+```{r}
+fig_pca <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = class)) +
+  geom_point(alpha = 0.5, size = 1) +
+  labs(
+    title = "PCA Projection of Transactions",
+    x = "Principal Component 1",
+    y = "Principal Component 2",
+    color = "Class"
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = "figures/02_pca_projection.png",
+  plot = fig_pca,
+  width = 8,
+  height = 5.5,
+  dpi = 300
+)
+```
+
+### 11.2.3 Clustering visual
+```{r}
+fig_cluster <- ggplot(pca_scores_sample, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(alpha = 0.5, size = 1) +
+  labs(
+    title = "K-means Clusters in PCA Space (k = 2)",
+    x = "Principal Component 1",
+    y = "Principal Component 2",
+    color = "Cluster"
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = "figures/03_clustering_visual.png",
+  plot = fig_cluster,
+  width = 8,
+  height = 5.5,
+  dpi = 300
+)
+```
+
+### 11.2.4 Regression model comparison chart
+```{r}
+regression_long <- regression_results %>%
+  pivot_longer(
+    cols = c(RMSE, MAE, R2),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+fig_regression <- ggplot(regression_long, aes(x = Model, y = Value)) +
+  geom_col() +
+  facet_wrap(~ Metric, scales = "free_y") +
+  coord_flip() +
+  labs(
+    title = "Regression Model Comparison",
+    x = "Model",
+    y = "Metric Value"
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = "figures/04_regression_model_comparison.png",
+  plot = fig_regression,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+```
+
+### 11.2.5 Classification model comparison chart
+```{r}
+fig_classification <- ggplot(classification_long, aes(x = Model, y = Value)) +
+  geom_col() +
+  facet_wrap(~ Metric, scales = "free_y") +
+  coord_flip() +
+  labs(
+    title = "Classification Model Comparison",
+    x = "Model",
+    y = "Metric Value"
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = "figures/05_classification_model_comparison.png",
+  plot = fig_classification,
+  width = 9,
+  height = 6,
+  dpi = 300
+)
+```
+
+### 11.2.6 Confusion matrix of the best classifier
+```{r}
+fig_confusion <- ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 5) +
+  labs(
+    title = "Confusion Matrix of the Random Forest Classifier",
+    x = "Actual Class",
+    y = "Predicted Class"
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = "figures/06_confusion_matrix_rf.png",
+  plot = fig_confusion,
+  width = 8,
+  height = 5.5,
+  dpi = 300
+)
+```
+
+### 11.2.7 Feature importance plot
+```{r}
+fig_importance <- ggplot(
+  importance_top,
+  aes(x = reorder(Feature, MeanDecreaseGini), y = MeanDecreaseGini)
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Top Predictive Features from Random Forest",
+    x = "Feature",
+    y = "Mean Decrease in Gini"
+  ) +
+  theme_minimal()
+
+ggsave(
+  filename = "figures/07_feature_importance.png",
+  plot = fig_importance,
+  width = 8.5,
+  height = 6,
+  dpi = 300
+)
+```
+
+## 11.3 Create final report tables
+```{r}
+library(writexl)
+
+dataset_summary_table <- tibble(
+  Metric = c(
+    "Number of observations after merge",
+    "Number of variables after merge",
+    "Labelled transactions",
+    "Unknown transactions",
+    "Illicit transactions (class 1)",
+    "Licit transactions (class 2)"
+  ),
+  Value = c(
+    nrow(df),
+    ncol(df),
+    nrow(df_labelled),
+    sum(df$class == "unknown", na.rm = TRUE),
+    sum(df$class == "1", na.rm = TRUE),
+    sum(df$class == "2", na.rm = TRUE)
+  )
+)
+
+methods_overview_table <- tibble(
+  Task = c("Unsupervised Learning", "Regression", "Classification"),
+  Techniques = c(
+    "PCA, K-means clustering",
+    "Linear Regression, Ridge, Lasso, Random Forest Regression",
+    "Logistic Regression, Support Vector Machine, Random Forest"
+  ),
+  Purpose = c(
+    "Explore structure and similarity groupings in the transaction feature space",
+    "Predict a proxy transaction risk score for analytical prioritisation",
+    "Classify licit and illicit transactions"
+  )
+)
+
+regression_results_table <- regression_results %>%
+  mutate(
+    RMSE = round(RMSE, 4),
+    MAE = round(MAE, 4),
+    R2 = round(R2, 4)
+  )
+
+classification_results_export <- classification_results_table
+
+top_features_export <- top_features_table
+```
+
+## 11.4 Export tables to Excel and CSV
+```{r}
+write_xlsx(
+  list(
+    dataset_summary = dataset_summary_table,
+    methods_overview = methods_overview_table,
+    regression_results = regression_results_table,
+    classification_results = classification_results_export,
+    top_features = top_features_export
+  ),
+  path = "outputs/st3189_report_tables.xlsx"
+)
+
+write.csv(
+  dataset_summary_table,
+  file = "outputs/01_dataset_summary.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  methods_overview_table,
+  file = "outputs/02_methods_overview.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  regression_results_table,
+  file = "outputs/03_regression_results.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  classification_results_export,
+  file = "outputs/04_classification_results.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  top_features_export,
+  file = "outputs/05_top_features.csv",
+  row.names = FALSE
+)
+```
+
+## 11.5 Export summary message
+```{r}
+cat("Export completed successfully.\n")
+cat("Figures saved in: figures/\n")
+cat("Tables saved in: outputs/\n")
+```
